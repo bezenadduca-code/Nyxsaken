@@ -49,25 +49,128 @@ local service = setmetatable({}, {
 	end,
 })
 
-local StreamBuffer
+-- ═══ Inlined StreamBuffer (replacement for the dead remote module) ═══
+local StreamBuffer = {}
 do
-	local filename = "StreamBuffer"
+	local Class = {}
+	Class.__index = Class
 
-	StreamBuffer = loadstring(
-		game:HttpGet("https://raw.githubusercontent.com/luau/SomeHub/main/" .. filename .. ".luau", true),
-		filename
-	)()
+	local create, copy = buffer.create, buffer.copy
+	local wu8, wu32, wstr = buffer.writeu8, buffer.writeu32, buffer.writestring
+	local readstring = buffer.readstring
+
+	function StreamBuffer.new(capacity)
+		capacity = math.max(capacity or 64, 16)
+		return setmetatable({ buf = create(capacity), len = 0, cap = capacity }, Class)
+	end
+
+	-- make sure `extra` more bytes fit after `len` (may replace self.buf)
+	function Class:reserve(extra)
+		local need = self.len + extra
+		if need <= self.cap then return end
+		local newCap = self.cap
+		while newCap < need do
+			newCap *= 2
+		end
+		local nb = create(newCap)
+		copy(nb, 0, self.buf, 0, self.len)
+		self.buf, self.cap = nb, newCap
+	end
+
+	-- reserve n bytes, advance len, return the offset where the region starts
+	function Class:allocRegion(n)
+		self:reserve(n)
+		local base = self.len
+		self.len = base + n
+		return base
+	end
+
+	function Class:writeu8(v)
+		self:reserve(1)
+		wu8(self.buf, self.len, v)
+		self.len += 1
+	end
+
+	function Class:writeu32(v)
+		self:reserve(4)
+		wu32(self.buf, self.len, v)
+		self.len += 4
+	end
+
+	function Class:writestring(str)
+		local n = #str
+		self:reserve(n)
+		wstr(self.buf, self.len, str)
+		self.len += n
+	end
+
+	function Class:writeLenString(str)
+		local n = #str
+		self:reserve(4 + n)
+		wu32(self.buf, self.len, n)
+		wstr(self.buf, self.len + 4, str)
+		self.len += 4 + n
+	end
+
+	function Class:tostring()
+		return readstring(self.buf, 0, self.len)
+	end
 end
 
-local global_container
+local global_container = {}
 do
-	local filename = "UniversalMethodFinder"
+	-- Inlined UniversalMethodFinder: scans the executor environment for functions whose
+	-- names satisfy each pattern. Patterns are called as pattern(name, containerName).
+	local env = (getgenv and getgenv()) or _G
+	local MAX_DEPTH = 3
 
-	local finder
-	finder, global_container = loadstring(
-		game:HttpGet("https://raw.githubusercontent.com/luau/SomeHub/main/" .. filename .. ".luau", true),
-		filename
-	)()
+	local finder = function(patterns, deep, _limit)
+		local compiled = {}
+		for key, src in patterns do
+			local fn = loadstring(src)
+			if not fn then
+				fn = loadstring("return " .. src)
+			end
+			if fn then
+				compiled[key] = fn
+			end
+		end
+
+		-- 1) exact global name wins
+		for key in compiled do
+			local v = env[key]
+			if type(v) == "function" then
+				global_container[key] = v
+			end
+		end
+
+		-- 2) otherwise scan by name pattern (globals first, then nested tables)
+		local visited = { [env] = true }
+		local function scan(tbl, containerName, depth)
+			for name, value in tbl do
+				if type(name) == "string" then
+					local lname = string.lower(name)
+					if type(value) == "function" then
+						for key, test in compiled do
+							if not global_container[key] then
+								local ok, res = pcall(test, lname, string.lower(containerName))
+								if ok and res then
+									global_container[key] = value
+								end
+							end
+						end
+					elseif deep and type(value) == "table" and depth < MAX_DEPTH
+						and not visited[value] and name ~= "_G" and name ~= "shared" then
+						visited[value] = true
+						scan(value, name, depth + 1)
+					end
+				end
+			end
+		end
+
+		pcall(scan, env, "", 0)
+		return global_container
+	end
 
 	finder({
 		base64encode = 'local a={...}local b=a[1]local function c(a,b)return string.find(a,b,nil,true)end;return c(b,"encode")and(c(b,"base64")or c(string.lower(tostring(a[2])),"base64"))',
