@@ -91,6 +91,12 @@ do
 		self.len += 1
 	end
 
+	function Class:writeu16(v)
+		self:reserve(2)
+		buffer.writeu16(self.buf, self.len, v)
+		self.len += 2
+	end
+
 	function Class:writeu32(v)
 		self:reserve(4)
 		wu32(self.buf, self.len, v)
